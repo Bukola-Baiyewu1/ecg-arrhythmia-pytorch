@@ -1,0 +1,28 @@
+# Every setting for a run lives here, so nothing is hidden in the code.
+split: patient          # patient (honest, inter-patient) or beat (leaky, for comparison)
+seed: 0
+
+data:
+  dir: data/mitdb       # where MIT-BIH is downloaded (not committed to git)
+  pre: 90               # samples before the R-peak (360 Hz -> 0.25 s)
+  post: 110             # samples after the R-peak (about 0.31 s)
+  n_val_records: 4      # whole training records held out for early stopping
+  synthetic_beats_per_record: 300
+
+model:
+  channels: [32, 64, 128]
+  kernel: 7
+  dropout: 0.2
+
+train:
+  epochs: 30
+  batch_size: 256
+  lr: 0.001
+  weight_decay: 0.0001
+  class_weighting: sqrt_inverse   # none | inverse | sqrt_inverse
+  patience: 5                     # early stopping on validation macro-F1
+  grad_clip: 1.0
+  amp: true                       # bfloat16 autocast on GPUs that support it
+
+eval:
+  n_bootstrap: 1000
