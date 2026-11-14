@@ -39,13 +39,16 @@ macro-F1 over N, S, V and F, as is common in the literature.
 
 ### v2 — beat shape + rhythm (RR-interval) features
 
-> Paste the table from `results/summary_v2.md` here after running v2 (see "Reproduce").
+| Split | Input | Class weighting | Accuracy | Macro-F1 (5 classes) | Macro-F1 (N,S,V,F) | Recall N | Recall S | Recall V | Recall F | Recall Q |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| patient | beat + RR | none | 0.924 ± 0.013 | 0.363 ± 0.014 | 0.453 ± 0.018 | 0.97 | 0.04 | 0.88 | 0.00 | 0.00 |
+| patient | beat + RR | sqrt_inverse | 0.834 ± 0.067 | 0.371 ± 0.023 | 0.464 ± 0.028 | 0.86 | 0.32 | 0.91 | 0.03 | 0.00 |
 
 **What v2 shows:** _(3 sentences after your run: S recall and macro-F1 (N,S,V,F) with vs
 without RR features on the patient split, and what still fails.)_
 
-Plots from the best patient-split run: `results/<run>/confusion_matrix.png` and
-`results/<run>/learning_curve.png`.
+Plots from the best patient-split run: ![Confusion matrix](results/confusion_matrix.png)
+![Learning curve](results/learning_curve.png).
 
 ## Method
 
