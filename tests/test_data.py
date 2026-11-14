@@ -26,8 +26,9 @@ def test_extract_beats_windows_labels_and_edges():
     signal = np.sin(np.linspace(0, 20, 2000))
     peaks = np.array([5, 500, 1000, 1995])          # first and last are too close to the edges
     symbols = ["N", "V", "+", "A"]                  # "+" is a rhythm marker, not a beat
-    X, y = D.extract_beats(signal, peaks, symbols, pre=90, post=110)
+    X, y, rr = D.extract_beats(signal, peaks, symbols, pre=90, post=110)
     assert X.shape == (1, 200) and y.tolist() == [2]  # only the V beat at 500 survives
+    assert rr.shape == (1, D.N_RR)
     assert abs(X[0].mean()) < 1e-5 and abs(X[0].std() - 1) < 1e-3  # z-scored
 
 
@@ -40,3 +41,14 @@ def test_validation_records_come_from_training_records():
     val = D.validation_records(D.DS1_TRAIN, 4, seed=0)
     assert len(val) == 4 and set(val) <= set(D.DS1_TRAIN)
     assert val == D.validation_records(D.DS1_TRAIN, 4, seed=0)  # reproducible
+
+
+def test_rr_features_flag_premature_beats():
+    # Regular rhythm every 300 samples, except beat 6 arrives early (200 after the previous one).
+    peaks = np.array([0, 300, 600, 900, 1200, 1500, 1700, 2100, 2400, 2700])
+    f = D.rr_features(peaks)
+    assert f.shape == (10, D.N_RR)
+    assert abs(f[3, 0] - 1.0) < 1e-6           # a normal beat: pre-RR equals the local average
+    assert f[6, 0] < 0.8                         # the early beat: pre-RR well below average
+    assert f[6, 1] > 1.2                         # followed by a longer pause
+    assert abs(f[3, 3] - 300 / D.FS) < 1e-6     # local RR in seconds

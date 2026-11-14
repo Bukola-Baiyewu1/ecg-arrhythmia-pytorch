@@ -22,6 +22,9 @@ def summary(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
     return {
         "accuracy": float(accuracy_score(y_true, y_pred)),
         "macro_f1": float(f1_score(y_true, y_pred, labels=labels, average="macro", zero_division=0)),
+        # Q has almost no beats once paced records are excluded, so the literature also
+        # reports macro-F1 over the four clinically relevant classes N, S, V, F.
+        "macro_f1_nsvf": float(f1_score(y_true, y_pred, labels=[0, 1, 2, 3], average="macro", zero_division=0)),
         "per_class": per_class_report(y_true, y_pred),
         "confusion_matrix": confusion_matrix(y_true, y_pred, labels=labels).tolist(),
     }

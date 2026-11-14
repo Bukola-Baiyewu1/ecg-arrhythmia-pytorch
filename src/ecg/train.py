@@ -84,11 +84,12 @@ def build_splits(cfg: dict, synthetic: bool, split: str, seed: int):
 
 
 @torch.no_grad()
-def predict(model: nn.Module, X: torch.Tensor, batch: int, device: str) -> np.ndarray:
+def predict(model: nn.Module, X: torch.Tensor, RR: torch.Tensor | None, batch: int, device: str) -> np.ndarray:
     model.eval()
     out = []
     for i in range(0, len(X), batch):
-        out.append(model(X[i:i + batch].to(device)).argmax(1).cpu())
+        rr = None if RR is None else RR[i:i + batch].to(device)
+        out.append(model(X[i:i + batch].to(device), rr).argmax(1).cpu())
     return torch.cat(out).numpy()
 
 
@@ -103,8 +104,17 @@ def run(cfg: dict, split: str, seed: int, synthetic: bool, out_root: Path) -> di
           f" | records in both train and test: {len(overlap)}")
 
     X = torch.tensor(data.X); y = torch.tensor(data.y)
+    use_rr = bool(cfg["model"].get("use_rr", False))
+    RR, rr_stats = None, None
+    if use_rr:
+        # Standardise with TRAINING statistics only (no information from test patients).
+        # Without this, 4 small raw numbers are drowned out by 128 beat-shape features.
+        mu, sd = data.rr[tr].mean(0), data.rr[tr].std(0) + 1e-6
+        RR = torch.tensor((data.rr - mu) / sd, dtype=torch.float32)
+        rr_stats = {"mean": mu.tolist(), "std": sd.tolist()}
     model = ECGNet(n_classes=len(D.AAMI_CLASSES), channels=tuple(cfg["model"]["channels"]),
-                   kernel=cfg["model"]["kernel"], dropout=cfg["model"]["dropout"]).to(device)
+                   kernel=cfg["model"]["kernel"], dropout=cfg["model"]["dropout"],
+                   n_rr=D.N_RR if use_rr else 0).to(device)
     w = class_weights(data.y[tr], len(D.AAMI_CLASSES), tcfg["class_weighting"])
     loss_fn = nn.CrossEntropyLoss(weight=None if w is None else w.to(device))
     opt = torch.optim.AdamW(model.parameters(), lr=tcfg["lr"], weight_decay=tcfg["weight_decay"])
@@ -121,14 +131,15 @@ def run(cfg: dict, split: str, seed: int, synthetic: bool, out_root: Path) -> di
         for i in range(0, len(perm), tcfg["batch_size"]):
             b = perm[i:i + tcfg["batch_size"]]
             xb, yb = X[b].to(device), y[b].to(device)
+            rb = None if RR is None else RR[b].to(device)
             opt.zero_grad()
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
-                loss = loss_fn(model(xb), yb)
+                loss = loss_fn(model(xb, rb), yb)
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), tcfg["grad_clip"])
             opt.step()
             total += loss.item() * len(b); n += len(b)
-        val_f1 = summary(data.y[va], predict(model, X[va], 1024, device))["macro_f1"]
+        val_f1 = summary(data.y[va], predict(model, X[va], None if RR is None else RR[va], 1024, device))["macro_f1"]
         history.append({"epoch": epoch, "train_loss": total / n, "val_macro_f1": val_f1})
         print(f"  epoch {epoch:2d}  train loss {total / n:.4f}  val macro-F1 {val_f1:.4f}")
         if val_f1 > best_f1:
@@ -142,28 +153,30 @@ def run(cfg: dict, split: str, seed: int, synthetic: bool, out_root: Path) -> di
     train_seconds = time.perf_counter() - t0
 
     model.load_state_dict(best_state)
-    y_pred = predict(model, X[te], 1024, device)
+    y_pred = predict(model, X[te], None if RR is None else RR[te], 1024, device)
     res = summary(data.y[te], y_pred)
     lo, hi = bootstrap_ci(data.y[te], y_pred, n_boot=cfg["eval"]["n_bootstrap"], seed=seed)
     res.update({
         "macro_f1_ci95": [lo, hi], "split": split, "seed": seed, "synthetic": synthetic,
-        "class_weighting": tcfg["class_weighting"], "git_commit": git_commit(),
+        "class_weighting": tcfg["class_weighting"], "use_rr": use_rr, "rr_standardisation": rr_stats,
+        "git_commit": git_commit(),
         "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "device": device, "parameters": count_parameters(model), "epochs_run": len(history),
         "train_seconds": round(train_seconds, 1), "best_val_macro_f1": best_f1,
         "records_in_train_and_test": len(overlap), "history": history,
     })
 
-    run_dir = out_root / f"{res['timestamp'].replace(':', '')}_{split}_{tcfg['class_weighting']}_s{seed}"
+    feat = "beat+rr" if use_rr else "beat"
+    run_dir = out_root / f"{res['timestamp'].replace(':', '')}_{split}_{feat}_{tcfg['class_weighting']}_s{seed}"
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "metrics.json").write_text(json.dumps(res, indent=2))
     (run_dir / "config.yaml").write_text(yaml.safe_dump(cfg))
     torch.save(best_state, run_dir / "model.pt")
     save_plots(res, run_dir)
-    append_run_row(out_root / "runs.csv", res)
+    append_run_row(out_root / "runs_v2.csv", res)
 
     print(f"TEST accuracy {res['accuracy']:.4f} | macro-F1 {res['macro_f1']:.4f} "
-          f"(95% CI {lo:.3f}-{hi:.3f}) | saved to {run_dir}")
+          f"(95% CI {lo:.3f}-{hi:.3f}) | macro-F1 N,S,V,F {res['macro_f1_nsvf']:.4f} | saved to {run_dir}")
     for name, m in res["per_class"].items():
         print(f"  {name}: recall {m['recall']:.3f}  precision {m['precision']:.3f}  support {m['support']}")
     return res
@@ -204,8 +217,8 @@ def save_plots(res: dict, run_dir: Path) -> None:
 
 def append_run_row(path: Path, res: dict) -> None:
     """One row per run, so every number can be traced to a commit, config and seed."""
-    row = {k: res[k] for k in ["timestamp", "git_commit", "split", "class_weighting", "seed",
-                               "synthetic", "accuracy", "macro_f1"]}
+    row = {k: res[k] for k in ["timestamp", "git_commit", "split", "use_rr", "class_weighting", "seed",
+                               "synthetic", "accuracy", "macro_f1", "macro_f1_nsvf"]}
     row["macro_f1_ci_low"], row["macro_f1_ci_high"] = res["macro_f1_ci95"]
     for name, m in res["per_class"].items():
         row[f"recall_{name}"] = round(m["recall"], 4)
@@ -229,6 +242,7 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=None)
     ap.add_argument("--weighting", choices=["none", "inverse", "sqrt_inverse"], default=None)
     ap.add_argument("--epochs", type=int, default=None)
+    ap.add_argument("--rr", choices=["on", "off"], default=None, help="add rhythm (RR) features")
     ap.add_argument("--synthetic", action="store_true", help="use fake data (no download)")
     ap.add_argument("--out", default="results")
     a = ap.parse_args()
@@ -238,6 +252,8 @@ def main() -> None:
         cfg["train"]["class_weighting"] = a.weighting
     if a.epochs:
         cfg["train"]["epochs"] = a.epochs
+    if a.rr:
+        cfg["model"]["use_rr"] = a.rr == "on"
     run(cfg, a.split or cfg["split"], cfg["seed"] if a.seed is None else a.seed, a.synthetic, Path(a.out))
 
 

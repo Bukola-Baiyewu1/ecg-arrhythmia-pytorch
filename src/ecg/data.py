@@ -40,10 +40,43 @@ class BeatSet:
     X: np.ndarray        # (n_beats, window) float32
     y: np.ndarray        # (n_beats,) int64 class index
     record: np.ndarray   # (n_beats,) int record number
+    rr: np.ndarray       # (n_beats, N_RR) float32 rhythm features, see rr_features()
+
+
+N_RR = 4
+FS = 360  # MIT-BIH sampling rate (Hz)
+
+
+def rr_features(peaks: np.ndarray, local_window: int = 10) -> np.ndarray:
+    """Rhythm features for each beat from the R-peak positions of one record.
+
+    An S (supraventricular) beat often looks like a normal beat; what gives it away
+    is that it arrives early. So for each beat we compute:
+      0. pre-RR / local average RR   (< 1 means premature)
+      1. post-RR / local average RR  (> 1 often means a compensatory pause)
+      2. pre-RR / post-RR
+      3. local average RR in seconds (the patient's current heart rate)
+    The local average uses only the previous ``local_window`` intervals, so the
+    features are relative to each patient's own rhythm and use no future beats
+    except the immediate next one (post-RR).
+    """
+    peaks = np.asarray(peaks, dtype=np.float64)
+    n = len(peaks)
+    if n < 3:
+        return np.ones((n, N_RR), np.float32)
+    rr = np.diff(peaks)                                   # rr[i] = peaks[i+1] - peaks[i]
+    pre = np.concatenate([[rr[0]], rr])                   # interval before beat i
+    post = np.concatenate([rr, [rr[-1]]])                 # interval after beat i
+    csum = np.concatenate([[0.0], np.cumsum(pre)])
+    idx = np.arange(n)
+    start = np.maximum(0, idx - local_window + 1)
+    local = (csum[idx + 1] - csum[start]) / (idx - start + 1)
+    feats = np.stack([pre / local, post / local, pre / post, local / FS], axis=1)
+    return feats.astype(np.float32)
 
 
 def extract_beats(signal: np.ndarray, peaks: np.ndarray, symbols: list[str],
-                  pre: int, post: int) -> tuple[np.ndarray, np.ndarray]:
+                  pre: int, post: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Cut a window around each annotated R-peak and map its symbol to a class.
 
     Beats whose symbol is not a heartbeat (rhythm or noise markers) and beats too
@@ -51,10 +84,13 @@ def extract_beats(signal: np.ndarray, peaks: np.ndarray, symbols: list[str],
     z-score normalised on its own, so amplitude differences between patients
     matter less.
     """
-    windows, labels = [], []
-    for peak, sym in zip(peaks, symbols):
-        if sym not in SYMBOL_TO_CLASS:
-            continue
+    # Rhythm is computed over heartbeat annotations only (not rhythm/noise markers).
+    beat_mask = [sym in SYMBOL_TO_CLASS for sym in symbols]
+    beat_peaks = np.asarray(peaks)[beat_mask]
+    beat_syms = [s for s, m in zip(symbols, beat_mask) if m]
+    rr_all = rr_features(beat_peaks)
+    windows, labels, rrs = [], [], []
+    for i, (peak, sym) in enumerate(zip(beat_peaks, beat_syms)):
         start, end = peak - pre, peak + post
         if start < 0 or end > len(signal):
             continue
@@ -62,12 +98,14 @@ def extract_beats(signal: np.ndarray, peaks: np.ndarray, symbols: list[str],
         w = (w - w.mean()) / (w.std() + 1e-6)
         windows.append(w)
         labels.append(SYMBOL_TO_CLASS[sym])
+        rrs.append(rr_all[i])
     if not windows:
-        return np.zeros((0, pre + post), np.float32), np.zeros(0, np.int64)
-    return np.stack(windows), np.array(labels, dtype=np.int64)
+        return (np.zeros((0, pre + post), np.float32), np.zeros(0, np.int64),
+                np.zeros((0, N_RR), np.float32))
+    return np.stack(windows), np.array(labels, dtype=np.int64), np.stack(rrs)
 
 
-def load_record(record: int, data_dir: Path, pre: int, post: int) -> tuple[np.ndarray, np.ndarray]:
+def load_record(record: int, data_dir: Path, pre: int, post: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Read one MIT-BIH record from disk and return its beats from lead MLII."""
     import wfdb  # imported here so tests without wfdb data still run
 
@@ -93,11 +131,11 @@ def download_mitdb(data_dir: Path) -> None:
 
 
 def load_records(records: list[int], data_dir: Path, pre: int, post: int) -> BeatSet:
-    Xs, ys, rs = [], [], []
+    Xs, ys, rs, rrs = [], [], [], []
     for r in records:
-        X, y = load_record(r, data_dir, pre, post)
-        Xs.append(X); ys.append(y); rs.append(np.full(len(y), r))
-    return BeatSet(np.concatenate(Xs), np.concatenate(ys), np.concatenate(rs))
+        X, y, rr = load_record(r, data_dir, pre, post)
+        Xs.append(X); ys.append(y); rs.append(np.full(len(y), r)); rrs.append(rr)
+    return BeatSet(np.concatenate(Xs), np.concatenate(ys), np.concatenate(rs), np.concatenate(rrs))
 
 
 def make_synthetic(records: list[int], beats_per_record: int, window: int, seed: int) -> BeatSet:
@@ -110,8 +148,11 @@ def make_synthetic(records: list[int], beats_per_record: int, window: int, seed:
     t = np.linspace(0, 1, window)
     centres, widths = [0.50, 0.42, 0.58, 0.45, 0.55], [0.03, 0.06, 0.08, 0.05, 0.10]
     share = np.array([0.80, 0.08, 0.07, 0.02, 0.03])
-    Xs, ys, rs = [], [], []
+    # Typical relative timing per class: S and V come early; V is followed by a long pause.
+    pre_ratio, post_ratio = [1.0, 0.72, 0.80, 0.95, 1.0], [1.0, 1.05, 1.30, 1.0, 1.0]
+    Xs, ys, rs, rrs = [], [], [], []
     for r in records:
+        hr = rng.uniform(0.6, 1.1)                      # this patient's RR interval in seconds
         signature = 0.5 * np.sin(2 * np.pi * rng.uniform(1, 4) * t + rng.uniform(0, 6))
         main = rng.choice(5, size=2, replace=False, p=share)
         p = share.copy(); p[main] *= 10; p /= p.sum()
@@ -120,8 +161,10 @@ def make_synthetic(records: list[int], beats_per_record: int, window: int, seed:
             beat = np.exp(-((t - centres[c]) ** 2) / (2 * widths[c] ** 2)) + signature
             beat = beat + rng.normal(0, 0.35, window)
             beat = (beat - beat.mean()) / (beat.std() + 1e-6)
+            pr = pre_ratio[c] + rng.normal(0, 0.06); po = post_ratio[c] + rng.normal(0, 0.06)
+            rrs.append([pr, po, pr / po, hr])
             Xs.append(beat.astype(np.float32)); ys.append(c); rs.append(r)
-    return BeatSet(np.stack(Xs), np.array(ys, np.int64), np.array(rs))
+    return BeatSet(np.stack(Xs), np.array(ys, np.int64), np.array(rs), np.array(rrs, np.float32))
 
 
 def split_by_record(data: BeatSet, test_records: list[int]) -> tuple[np.ndarray, np.ndarray]:

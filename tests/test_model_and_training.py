@@ -59,4 +59,20 @@ def test_end_to_end_synthetic_run(tmp_path):
     res = run(cfg, "patient", seed=0, synthetic=True, out_root=tmp_path)
     assert res["records_in_train_and_test"] == 0
     assert 0.0 <= res["macro_f1"] <= 1.0
-    assert (tmp_path / "runs.csv").exists()
+    assert (tmp_path / "runs_v2.csv").exists()
+
+
+def test_model_with_rr_branch():
+    model = ECGNet(n_rr=4).eval()
+    assert model(torch.randn(3, 200), torch.randn(3, 4)).shape == (3, 5)
+
+
+def test_end_to_end_with_rr_features(tmp_path):
+    with open("configs/default.yaml") as f:
+        cfg = yaml.safe_load(f)
+    cfg["model"]["use_rr"] = True
+    cfg["train"]["epochs"] = 2
+    cfg["data"]["synthetic_beats_per_record"] = 40
+    cfg["eval"]["n_bootstrap"] = 20
+    res = run(cfg, "patient", seed=0, synthetic=True, out_root=tmp_path)
+    assert res["use_rr"] is True and 0.0 <= res["macro_f1_nsvf"] <= 1.0
