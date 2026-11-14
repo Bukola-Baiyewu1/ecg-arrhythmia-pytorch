@@ -1,0 +1,26 @@
+data:
+  dir: data/mitdb
+  n_val_records: 4
+  post: 110
+  pre: 90
+  synthetic_beats_per_record: 300
+eval:
+  n_bootstrap: 1000
+model:
+  channels:
+  - 32
+  - 64
+  - 128
+  dropout: 0.2
+  kernel: 7
+seed: 0
+split: patient
+train:
+  amp: true
+  batch_size: 256
+  class_weighting: none
+  epochs: 30
+  grad_clip: 1.0
+  lr: 0.001
+  patience: 5
+  weight_decay: 0.0001
